@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quiet Frequency</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
+  canvas:active { cursor: grabbing; }
+  #loading {
+    position: fixed; color: #8a8a8a; font: 11px/1.4 ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: .12em; text-transform: uppercase; pointer-events: none;
+  }
+  #loading { left: 50%; top: 50%; transform: translate(-50%, -50%); color: #ddd; }
+</style>
+</head>
+<body>
+<div id="loading">loading 0%</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+
+const MODEL = 'quiet-frequency.glb';
+const CHARS = ' .`:-=+*cox%#&@$';   // dark → bright
+const NOISE = '01<>/\\|[]{}?!~^;'; // glitch glyphs
+
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 1);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, 1, 0.01, 100);
+camera.position.set(0, 0.2, 3.6);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.enablePan = false;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 1.2;
+controls.minDistance = 1.6;
+controls.maxDistance = 7;
+
+// ---------- model material: lit luminance + vertex wave ----------
+const uniforms = {
+  uTime: { value: 0 },
+  uLight: { value: new THREE.Vector3(1, 1, 1) },
+  uPulse: { value: 0 },
+};
+const modelMat = new THREE.ShaderMaterial({
+  uniforms,
+  vertexShader: /* glsl */`
+    uniform float uTime; uniform float uPulse;
+    varying vec3 vN; varying vec3 vW; varying float vWave;
+    void main() {
+      vec3 p = position;
+      float w = sin(p.y * 9.0 - uTime * 2.2) * 0.5 + 0.5;
+      float w2 = sin(length(p.xz) * 14.0 - uTime * 3.1);
+      float amp = 0.018 + uPulse * 0.06;
+      p += normal * (w * amp + w2 * amp * 0.5);
+      vWave = w;
+      vec4 wp = modelMatrix * vec4(p, 1.0);
+      vW = wp.xyz;
+      vN = normalize(mat3(modelMatrix) * normal);
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }`,
+  fragmentShader: /* glsl */`
+    uniform vec3 uLight; uniform float uTime;
+    varying vec3 vN; varying vec3 vW; varying float vWave;
+    void main() {
+      vec3 n = normalize(vN);
+      vec3 v = normalize(cameraPosition - vW);
+      float diff = max(dot(n, normalize(uLight)), 0.0);
+      float rim = pow(1.0 - max(dot(n, v), 0.0), 2.5);
+      float band = smoothstep(0.85, 1.0, vWave) * 0.35;
+      float lum = 0.14 + diff * 0.85 + rim * 0.7 + band;
+      gl_FragColor = vec4(vec3(clamp(lum, 0.0, 1.0)), 1.0);
+    }`,
+});
+
+// ---------- offscreen target ----------
+const rt = new THREE.WebGLRenderTarget(1, 1, { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter });
+
+// ---------- glyph atlas ----------
+function atlas(str) {
+  const S = 64, c = document.createElement('canvas');
+  c.width = S * str.length; c.height = S;
+  const g = c.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, c.width, c.height);
+  g.fillStyle = '#fff'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = `600 ${S * 0.82}px ui-monospace, Menlo, Consolas, monospace`;
+  [...str].forEach((ch, i) => g.fillText(ch, i * S + S / 2, S / 2 + 2));
+  const t = new THREE.CanvasTexture(c);
+  t.minFilter = THREE.LinearFilter; t.generateMipmaps = false;
+  return t;
+}
+
+// ---------- ASCII pass ----------
+const asciiUniforms = {
+  tScene: { value: rt.texture },
+  tChars: { value: atlas(CHARS) },
+  tNoise: { value: atlas(NOISE) },
+  uCount: { value: CHARS.length },
+  uNoiseCount: { value: NOISE.length },
+  uRes: { value: new THREE.Vector2() },
+  uCell: { value: 12 },
+  uTime: { value: 0 },
+  uMouse: { value: new THREE.Vector2(-1, -1) },
+  uGlitch: { value: 0 },
+};
+const asciiMat = new THREE.ShaderMaterial({
+  uniforms: asciiUniforms,
+  vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tScene, tChars, tNoise;
+    uniform float uCount, uNoiseCount, uCell, uTime, uGlitch;
+    uniform vec2 uRes, uMouse;
+    varying vec2 vUv;
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+    void main() {
+      vec2 px = vUv * uRes;
+      vec2 cellSize = vec2(uCell * 0.62, uCell);   // monospace aspect
+      vec2 cell = floor(px / cellSize);
+      float rows = floor(uRes.y / cellSize.y);
+
+      // horizontal glitch bands
+      float tick = floor(uTime * 12.0);
+      float bandOn = step(0.93 - uGlitch * 0.3, hash(vec2(floor(cell.y / 3.0), tick)));
+      float shift = (hash(vec2(cell.y, tick)) - 0.5) * 14.0 * bandOn;
+      vec2 sc = cell + vec2(floor(shift), 0.0);
+
+      vec2 cuv = (sc + 0.5) * cellSize / uRes;
+      float lum = texture2D(tScene, cuv).r;
+
+      // mouse ripple
+      vec2 m = uMouse * uRes / cellSize;
+      float d = length((cell - m) * vec2(0.62, 1.0));
+      float ripple = uMouse.x < 0.0 ? 0.0 : exp(-d * 0.09) * (0.5 + 0.5 * sin(d * 0.9 - uTime * 8.0));
+      lum = clamp(lum + ripple * 0.35 * step(0.05, lum), 0.0, 1.0);
+
+      // falling background drizzle
+      float col = hash(vec2(cell.x, 7.0));
+      float fall = fract(cell.y / rows + uTime * (0.05 + col * 0.12) + col);
+      float drizzle = step(0.985, hash(vec2(cell.x, floor(fall * rows)))) * smoothstep(0.0, 0.3, fall) * 0.18;
+
+      vec2 inCell = fract(px / cellSize);
+      float idx; float g;
+      float flick = hash(sc + tick * 1.37);
+      bool noisy = lum > 0.05 && flick > 0.965 - uGlitch * 0.25;
+      if (noisy || (lum <= 0.05 && drizzle > 0.0)) {
+        idx = floor(hash(sc + floor(uTime * 20.0)) * uNoiseCount);
+        g = texture2D(tNoise, vec2((idx + inCell.x) / uNoiseCount, inCell.y)).r;
+      } else {
+        idx = min(floor(lum * uCount), uCount - 1.0);
+        g = texture2D(tChars, vec2((idx + inCell.x) / uCount, inCell.y)).r;
+      }
+
+      float bright = lum > 0.05 ? (0.35 + lum * 0.85) : drizzle * 3.0;
+      vec3 base = mix(vec3(0.55, 0.62, 0.7), vec3(1.0), lum);
+      vec3 color = base * bright * g;
+      if (noisy) color = vec3(0.6, 1.0, 0.85) * g * 0.9;
+      color += vec3(0.4, 0.9, 1.0) * ripple * 0.45 * g * step(0.05, lum);
+      gl_FragColor = vec4(color, 1.0);
+    }`,
+});
+const post = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), asciiMat);
+const postScene = new THREE.Scene(); postScene.add(post);
+const postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+// ---------- load ----------
+const loadingEl = document.getElementById('loading');
+const pivot = new THREE.Group(); scene.add(pivot);
+const draco = new DRACOLoader().setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/gltf/');
+new GLTFLoader().setDRACOLoader(draco).load(MODEL, (gltf) => {
+  gltf.scene.traverse((o) => {
+    if (o.isMesh) {
+      if (!o.geometry.attributes.normal) o.geometry.computeVertexNormals();
+      o.material = modelMat;
+    }
+  });
+  const box = new THREE.Box3().setFromObject(gltf.scene);
+  const size = box.getSize(new THREE.Vector3()).length();
+  gltf.scene.position.sub(box.getCenter(new THREE.Vector3()));
+  pivot.scale.setScalar(3.0 / size);
+  pivot.add(gltf.scene);
+  loadingEl.remove();
+}, (e) => {
+  if (e.total) loadingEl.textContent = `loading ${Math.round(e.loaded / e.total * 100)}%`;
+}, (err) => { loadingEl.textContent = 'failed to load model'; console.error(err); });
+
+// ---------- interaction ----------
+addEventListener('pointermove', (e) => asciiUniforms.uMouse.value.set(e.clientX / innerWidth, 1 - e.clientY / innerHeight));
+addEventListener('pointerleave', () => asciiUniforms.uMouse.value.set(-1, -1));
+addEventListener('pointerdown', () => { kick = 1; });
+let kick = 0;
+
+function resize() {
+  const w = innerWidth, h = innerHeight, dpr = renderer.getPixelRatio();
+  renderer.setSize(w, h);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+  asciiUniforms.uRes.value.set(w * dpr, h * dpr);
+  asciiUniforms.uCell.value = Math.round((w < 700 ? 9 : 12) * dpr);
+  rt.setSize(Math.ceil(w / 4), Math.ceil(h / 4)); // low-res is enough for cell sampling
+}
+addEventListener('resize', resize); resize();
+
+// ---------- loop ----------
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const t = clock.getElapsedTime();
+  kick *= 0.94;
+  uniforms.uTime.value = t;
+  uniforms.uPulse.value = Math.pow(Math.sin(t * 0.7) * 0.5 + 0.5, 6) + kick;
+  uniforms.uLight.value.set(Math.cos(t * 0.6) * 2, 1.2 + Math.sin(t * 0.9), Math.sin(t * 0.6) * 2);
+  asciiUniforms.uTime.value = t;
+  asciiUniforms.uGlitch.value = Math.min(1, kick + Math.pow(Math.max(0, Math.sin(t * 0.37)), 40));
+  pivot.position.y = Math.sin(t * 0.8) * 0.05;
+  pivot.rotation.z = Math.sin(t * 0.5) * 0.06;
+  controls.update();
+
+  renderer.setRenderTarget(rt);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  renderer.render(postScene, postCam);
+});
+</script>
+</body>
+</html>

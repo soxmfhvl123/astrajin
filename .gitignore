@@ -1,0 +1,7 @@
+# raw Meshy originals (150MB .blend would break the GitHub push limit) -
+# the site loads the decimated + Draco-compressed quiet-frequency.glb
+*.blend
+Meshy_AI_*.glb
+
+# local preview config
+.claude/
